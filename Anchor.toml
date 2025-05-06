@@ -1,0 +1,9 @@
+[programs.localnet]
+oracle = "programs/oracle/target/deploy/oracle.so"
+
+[provider]
+cluster = "localnet"
+wallet = "~/.config/solana/id.json"
+
+[scripts]
+test = "tests/integration.rs" 

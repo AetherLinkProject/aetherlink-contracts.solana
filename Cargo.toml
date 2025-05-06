@@ -1,0 +1,7 @@
+[workspace]
+members = [
+    "programs/oracle"
+]
+
+[profile.release]
+opt-level = "z" 
