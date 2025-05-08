@@ -1,0 +1,424 @@
+// SPDX-License-Identifier: MIT
+// Anchor Oracle Program - Unified Structure
+
+use anchor_lang::prelude::*;
+use anchor_lang::prelude::{AnchorSerialize, AnchorDeserialize};
+use anchor_lang::Discriminator;
+use anchor_lang::error_code;
+use solana_program::sysvar::clock::Clock;
+use anchor_lang::solana_program::sysvar;
+use solana_program::sysvar::instructions::{load_current_index_checked, load_instruction_at_checked};
+use solana_program::secp256k1_program;
+use sha2::Sha256;
+use sha2::Digest;
+use hex;
+
+// declare_id for the program
+
+declare_id!("Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkgMQHGt1hFJk");
+
+// --- Account Structs ---
+
+#[account]
+#[derive(Debug)]
+pub struct OracleNode {
+    pub node_id: u64,    // Node index
+    pub pubkey: Pubkey,  // Node public key
+}
+
+impl Default for OracleNode {
+    fn default() -> Self {
+        Self {
+            node_id: 0,
+            pubkey: Pubkey::default(),
+        }
+    }
+}
+
+#[derive(Debug, AnchorSerialize, AnchorDeserialize, Clone, Default)]
+pub struct ReportContext {
+    pub message_id: String,   // Cross-chain message unique id
+    pub sender: String,      // Source chain contract
+    pub receiver: Pubkey,    // Next contract address
+    pub src_chain: u64,      // Source chain ID
+    pub dst_chain: u64,      // Destination chain ID
+    pub epoch: u64,          // Cross-chain epoch
+}
+
+#[derive(Debug, AnchorSerialize, AnchorDeserialize, Clone, Default)]
+pub struct TokenTransferMetadata {
+    pub target_chain_id: u64,    // Destination chain ID
+    pub token_address: Pubkey,   // Token address
+    pub symbol: [u8; 16],        // Token symbol, fixed 16 bytes
+    pub amount: u64,             // Transfer amount
+    pub extra_data: String,      // Extra data
+}
+
+#[account]
+#[derive(Debug)]
+pub struct CrossChainMessage {
+    pub message_id: String, // Cross-chain message unique id
+    pub status: u8,         // message status (0=pending, 1=completed, 2=failed)
+    pub bump: u8,
+}
+
+impl Default for CrossChainMessage {
+    fn default() -> Self {
+        Self {
+            message_id: String::new(),
+            status: 0,
+            bump: 0,
+        }
+    }
+}
+
+#[account]
+pub struct EpochState {
+    pub epoch: u64,
+    pub bump: u8,
+}
+
+#[account]
+#[derive(Debug, PartialEq, Eq)]
+pub struct OracleConfig {
+    pub admin: Pubkey, // Global admin
+    pub chain_whitelist: [u64; 8], // Fixed-length chain whitelist
+    pub oracle_nodes: [Pubkey; 8], // Fixed-length oracle node set
+    pub sender_whitelist: [Pubkey; 8], // Fixed-length sender whitelist
+    pub is_initialized: bool, // Initialization flag
+}
+
+// --- Context/Accounts Structs ---
+
+#[derive(Accounts)]
+pub struct RegisterNode<'info> {
+    #[account(
+        init,
+        payer = authority,
+        space = 8 + std::mem::size_of::<OracleNode>(),
+        seeds = [b"oracle_node", authority.key().as_ref()],
+        bump
+    )]
+    pub oracle_node: Account<'info, OracleNode>,
+    #[account(mut)]
+    pub authority: Signer<'info>,
+    pub system_program: Program<'info, System>,
+    pub oracle_config: Account<'info, OracleConfig>,
+}
+
+#[derive(Accounts)]
+pub struct SendRequest<'info> {
+    pub receiver: AccountInfo<'info>,
+    /// CHECK: sender whitelist PDA
+    pub sender_whitelist: AccountInfo<'info>,
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    pub system_program: Program<'info, System>,
+    #[account(address = sysvar::clock::ID)]
+    pub clock: AccountInfo<'info>,
+    #[account(mut, seeds = [b"epoch_state"], bump = epoch_state.bump)]
+    pub epoch_state: Account<'info, EpochState>,
+    pub oracle_config: Account<'info, OracleConfig>,
+}
+
+#[derive(Accounts)]
+pub struct ReceiveMessage<'info> {
+    pub chain_message: Account<'info, CrossChainMessage>,
+    pub receiver: Signer<'info>,
+    pub oracle_config: Account<'info, OracleConfig>,
+}
+
+#[derive(Accounts)]
+pub struct UpdateNode<'info> {
+    pub oracle_node: Account<'info, OracleNode>,
+    pub authority: Signer<'info>,
+    pub oracle_config: Account<'info, OracleConfig>,
+}
+
+#[derive(Accounts)]
+pub struct SetChainWhitelist<'info> {
+    #[account(mut)]
+    pub oracle_config: Account<'info, OracleConfig>,
+    pub authority: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct SetOracleNodes<'info> {
+    #[account(mut)]
+    pub oracle_config: Account<'info, OracleConfig>,
+    pub authority: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct InitEpochState<'info> {
+    #[account(
+        init,
+        payer = authority,
+        space = 8 + 8 + 1, // discriminator + u64 + u8
+        seeds = [b"epoch_state"],
+        bump
+    )]
+    pub epoch_state: Account<'info, EpochState>,
+    #[account(mut)]
+    pub authority: Signer<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct InitOracleConfig<'info> {
+    #[account(
+        init,
+        payer = authority,
+        space = 8 + 32 + 8*8 + 32*8 + 32*8 + 1, // discriminator + Pubkey + 8 u64 + 8 Pubkey + 8 sender Pubkey + bool
+        seeds = [b"oracle_config"],
+        bump
+    )]
+    pub oracle_config: Account<'info, OracleConfig>,
+    #[account(mut)]
+    pub authority: Signer<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct SetAdmin<'info> {
+    #[account(mut)]
+    pub oracle_config: Account<'info, OracleConfig>,
+    pub authority: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct AddSender<'info> {
+    #[account(mut)]
+    pub oracle_config: Account<'info, OracleConfig>,
+    pub authority: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct RemoveSender<'info> {
+    #[account(mut)]
+    pub oracle_config: Account<'info, OracleConfig>,
+    pub authority: Signer<'info>,
+}
+
+// --- Error Codes ---
+
+#[error_code]
+pub enum OracleError {
+    #[msg("Invalid node metadata")] 
+    InvalidMetadata,
+    #[msg("Node already exists")] 
+    NodeAlreadyExists,
+    #[msg("Unauthorized operation")] 
+    Unauthorized,
+    #[msg("Invalid whitelist action")] 
+    InvalidWhitelistAction,
+    #[msg("Duplicate message_id submitted")]
+    DuplicateMessageId,
+    #[msg("Invalid sender address")]
+    InvalidSenderAddress,
+}
+
+// --- Logic Functions ---
+
+pub fn register_node_logic(node: &mut OracleNode, node_id: u64, pubkey: Pubkey) {
+    node.node_id = node_id;
+    node.pubkey = pubkey;
+}
+
+pub fn update_node_logic(node: &mut OracleNode, node_id: u64, pubkey: Pubkey) {
+    node.node_id = node_id;
+    node.pubkey = pubkey;
+}
+
+pub fn initialize_logic(config: &mut OracleConfig, authority: &Pubkey, chain_ids: [u64; 8], node_pubkeys: [Pubkey; 8]) -> Result<()> {
+    require!(!config.is_initialized, OracleError::InvalidMetadata);
+    config.admin = *authority;
+    config.chain_whitelist = chain_ids;
+    config.oracle_nodes = node_pubkeys;
+    config.is_initialized = true;
+    Ok(())
+}
+
+pub fn set_admin_logic(config: &mut OracleConfig, authority: &Pubkey, admin: Pubkey) -> Result<()> {
+    require!(config.is_initialized, OracleError::InvalidMetadata);
+    require!(*authority == config.admin, OracleError::Unauthorized);
+    require!(admin != Pubkey::default(), OracleError::InvalidMetadata);
+    msg!("Admin changed from {} to {}", config.admin, admin);
+    config.admin = admin;
+    Ok(())
+}
+
+pub fn set_chain_whitelist_logic(config: &mut OracleConfig, authority: &Pubkey, chain_ids: [u64; 8]) -> Result<()> {
+    require!(*authority == config.admin, OracleError::Unauthorized);
+    config.chain_whitelist = chain_ids;
+    Ok(())
+}
+
+pub fn set_oracle_nodes_logic(config: &mut OracleConfig, authority: &Pubkey, node_pubkeys: [Pubkey; 8]) -> Result<()> {
+    require!(*authority == config.admin, OracleError::Unauthorized);
+    config.oracle_nodes = node_pubkeys;
+    Ok(())
+}
+
+pub fn add_sender_logic(config: &mut OracleConfig, authority: &Pubkey, sender: Pubkey) -> Result<()> {
+    require!(*authority == config.admin, OracleError::Unauthorized);
+    for slot in config.sender_whitelist.iter_mut() {
+        if *slot == Pubkey::default() {
+            *slot = sender;
+            return Ok(());
+        }
+        if *slot == sender {
+            return Ok(()); // already whitelisted
+        }
+    }
+    Err(OracleError::InvalidWhitelistAction.into())
+}
+
+pub fn remove_sender_logic(config: &mut OracleConfig, authority: &Pubkey, sender: Pubkey) -> Result<()> {
+    require!(*authority == config.admin, OracleError::Unauthorized);
+    for slot in config.sender_whitelist.iter_mut() {
+        if *slot == sender {
+            *slot = Pubkey::default();
+            return Ok(());
+        }
+    }
+    Err(OracleError::InvalidWhitelistAction.into())
+}
+
+pub fn send_request_logic(
+    payer: &Pubkey,
+    chain_whitelist: &[u64; 8],
+    sender_whitelist: &[Pubkey; 8],
+    target_chain_id: u64,
+    receiver: &Pubkey,
+    message: &[u8],
+    token_transfer_metadata: &TokenTransferMetadata,
+    epoch: u64,
+    blocktime: i64,
+) -> Result<String> {
+    let mut valid_sender = false;
+    for s in sender_whitelist.iter() {
+        if *s == *payer {
+            valid_sender = true;
+            break;
+        }
+    }
+    require!(valid_sender, OracleError::InvalidSenderAddress);
+    let mut whitelisted = false;
+    for chain_id in chain_whitelist.iter() {
+        if *chain_id == target_chain_id { whitelisted = true; break; }
+    }
+    require!(whitelisted, OracleError::Unauthorized);
+    let report_context = ReportContext {
+        message_id: String::new(),
+        sender: String::new(),
+        receiver: *receiver,
+        src_chain: 0,
+        dst_chain: target_chain_id,
+        epoch,
+    };
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(&report_context.try_to_vec().unwrap());
+    hasher.update(message);
+    hasher.update(&token_transfer_metadata.try_to_vec().unwrap());
+    hasher.update(&blocktime.to_le_bytes());
+    let message_id = hex::encode(hasher.finalize());
+    msg!("Event: RequestSent {{ message_id: {}, target_chain_id: {}, receiver: {}, message: {:?}, token_transfer_metadata: {:?}, epoch: {}, blocktime: {} }}",
+        message_id, target_chain_id, receiver, message, token_transfer_metadata, epoch, blocktime);
+    Ok(message_id)
+}
+
+// Program module forwarding
+pub mod Oracle {
+    use super::*;
+    pub fn initialize(ctx: Context<InitOracleConfig>, chain_ids: [u64; 8], node_pubkeys: [Pubkey; 8]) -> Result<()> {
+        initialize_logic(&mut ctx.accounts.oracle_config, &ctx.accounts.authority.key(), chain_ids, node_pubkeys)
+    }
+    pub fn set_admin(ctx: Context<SetAdmin>, admin: Pubkey) -> Result<()> {
+        set_admin_logic(&mut ctx.accounts.oracle_config, &ctx.accounts.authority.key(), admin)
+    }
+    pub fn set_chain_whitelist(ctx: Context<SetChainWhitelist>, chain_ids: [u64; 8]) -> Result<()> {
+        set_chain_whitelist_logic(&mut ctx.accounts.oracle_config, &ctx.accounts.authority.key(), chain_ids)
+    }
+    pub fn set_oracle_nodes(ctx: Context<SetOracleNodes>, node_pubkeys: [Pubkey; 8]) -> Result<()> {
+        set_oracle_nodes_logic(&mut ctx.accounts.oracle_config, &ctx.accounts.authority.key(), node_pubkeys)
+    }
+    pub fn add_sender(ctx: Context<AddSender>, sender: Pubkey) -> Result<()> {
+        add_sender_logic(&mut ctx.accounts.oracle_config, &ctx.accounts.authority.key(), sender)
+    }
+    pub fn remove_sender(ctx: Context<RemoveSender>, sender: Pubkey) -> Result<()> {
+        remove_sender_logic(&mut ctx.accounts.oracle_config, &ctx.accounts.authority.key(), sender)
+    }
+    pub fn send_request(
+        ctx: Context<SendRequest>,
+        target_chain_id: u64,
+        receiver: String,
+        message: Vec<u8>,
+        token_transfer_metadata: TokenTransferMetadata,
+    ) -> Result<()> {
+        let _ = send_request_logic(
+            &ctx.accounts.payer.key(),
+            &ctx.accounts.oracle_config.chain_whitelist,
+            &ctx.accounts.oracle_config.sender_whitelist,
+            target_chain_id,
+            &ctx.accounts.receiver.key(),
+            &message,
+            &token_transfer_metadata,
+            ctx.accounts.epoch_state.epoch,
+            Clock::from_account_info(&ctx.accounts.clock)?.unix_timestamp,
+        )?;
+        Ok(())
+    }
+}
+
+// --- Simple signature verification ---
+pub fn verify_signature_secp256k1(
+    message: &[u8],
+    signature: &[u8],
+    pubkey: &[u8],
+    instructions_account: &AccountInfo,
+) -> bool {
+    let ix_index = match load_current_index_checked(instructions_account) {
+        Ok(idx) => idx,
+        Err(_) => {
+            msg!("Failed to load current instruction index");
+            return false;
+        }
+    };
+    for i in 0..ix_index {
+        let ix = match load_instruction_at_checked(i as usize, instructions_account) {
+            Ok(ix) => ix,
+            Err(_) => continue,
+        };
+        if ix.program_id == solana_program::secp256k1_program::ID {
+            if ix.data.windows(pubkey.len()).any(|w| w == pubkey)
+                && ix.data.windows(signature.len()).any(|w| w == signature)
+                && ix.data.windows(message.len()).any(|w| w == message)
+            {
+                msg!("Found matching secp256k1 signature");
+                return true;
+            }
+        }
+    }
+    msg!("No matching secp256k1 signature found");
+    false
+}
+
+pub fn verify_signatures_secp256k1(
+    message: &[u8],
+    signatures: &[Vec<u8>],
+    pubkeys: &[Vec<u8>],
+    instructions_account: &AccountInfo,
+) -> bool {
+    if signatures.len() != pubkeys.len() {
+        msg!("Signatures and pubkeys length mismatch");
+        return false;
+    }
+    for (sig, pubkey) in signatures.iter().zip(pubkeys.iter()) {
+        if !verify_signature_secp256k1(message, sig, pubkey, instructions_account) {
+            msg!("Signature verification failed for one of the pairs");
+            return false;
+        }
+    }
+    true
+} 

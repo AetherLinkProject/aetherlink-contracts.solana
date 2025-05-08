@@ -1,0 +1,23 @@
+[toolchain]
+anchor_version = "0.31.1"
+
+[features]
+resolution = true
+skip-lint = false
+
+[programs.localnet]
+oracle = "Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkgMQHGt1hFJk"
+
+[registry]
+url = "https://api.apr.dev"
+
+[provider]
+cluster = "devnet"
+wallet = "~/.config/solana/id.json"
+
+[scripts]
+test = "tests/integration.rs"
+
+[dependencies]
+anchor-lang = "0.31.1"
+anchor-spl = "0.31.1"
