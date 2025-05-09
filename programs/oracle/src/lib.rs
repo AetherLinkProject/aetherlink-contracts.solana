@@ -106,7 +106,6 @@ pub struct RegisterNode<'info> {
 
 #[derive(Accounts)]
 pub struct SendRequest<'info> {
-    pub receiver: AccountInfo<'info>,
     /// CHECK: sender whitelist PDA
     pub sender_whitelist: AccountInfo<'info>,
     #[account(mut)]
@@ -296,8 +295,9 @@ pub fn send_request_logic(
     payer: &Pubkey,
     chain_whitelist: &[u64; 8],
     sender_whitelist: &[Pubkey; 8],
-    target_chain_id: u64,
-    receiver: &Pubkey,
+    sender: &str,
+    dst_chain_id: u64,
+    receiver: &str,
     message: &[u8],
     token_transfer_metadata: &TokenTransferMetadata,
     epoch: u64,
@@ -313,25 +313,21 @@ pub fn send_request_logic(
     require!(valid_sender, OracleError::InvalidSenderAddress);
     let mut whitelisted = false;
     for chain_id in chain_whitelist.iter() {
-        if *chain_id == target_chain_id { whitelisted = true; break; }
+        if *chain_id == dst_chain_id { whitelisted = true; break; }
     }
     require!(whitelisted, OracleError::Unauthorized);
-    let report_context = ReportContext {
-        message_id: String::new(),
-        sender: String::new(),
-        receiver: *receiver,
-        src_chain: 0,
-        dst_chain: target_chain_id,
-        epoch,
-    };
+    // messageId: keccak256(abi.encodePacked(sender, dstChainId, receiver, message, tokenTransferMetadata, epoch, blocktime))
     let mut hasher = sha2::Sha256::new();
-    hasher.update(&report_context.try_to_vec().unwrap());
+    hasher.update(sender.as_bytes());
+    hasher.update(&dst_chain_id.to_le_bytes());
+    hasher.update(receiver.as_bytes());
     hasher.update(message);
     hasher.update(&token_transfer_metadata.try_to_vec().unwrap());
+    hasher.update(&epoch.to_le_bytes());
     hasher.update(&blocktime.to_le_bytes());
     let message_id = hex::encode(hasher.finalize());
-    msg!("Event: RequestSent {{ message_id: {}, target_chain_id: {}, receiver: {}, message: {:?}, token_transfer_metadata: {:?}, epoch: {}, blocktime: {} }}",
-        message_id, target_chain_id, receiver, message, token_transfer_metadata, epoch, blocktime);
+    msg!("Event: RequestSent {{ message_id: {}, sender: {}, dst_chain_id: {}, receiver: {}, message: {:?}, token_transfer_metadata: {:?}, epoch: {}, blocktime: {} }}",
+        message_id, sender, dst_chain_id, receiver, message, token_transfer_metadata, epoch, blocktime);
     Ok(message_id)
 }
 
@@ -358,17 +354,19 @@ pub mod Oracle {
     }
     pub fn send_request(
         ctx: Context<SendRequest>,
-        target_chain_id: u64,
+        dst_chain_id: u64,
         receiver: String,
         message: Vec<u8>,
         token_transfer_metadata: TokenTransferMetadata,
     ) -> Result<()> {
+        let sender = crate::ID.to_string();
         let _ = send_request_logic(
             &ctx.accounts.payer.key(),
             &ctx.accounts.oracle_config.chain_whitelist,
             &ctx.accounts.oracle_config.sender_whitelist,
-            target_chain_id,
-            &ctx.accounts.receiver.key(),
+            &sender,
+            dst_chain_id,
+            &receiver,
             &message,
             &token_transfer_metadata,
             ctx.accounts.epoch_state.epoch,

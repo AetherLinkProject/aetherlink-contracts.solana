@@ -20,15 +20,6 @@ fn create_oracle_config(admin: Pubkey, is_initialized: bool) -> OracleConfig {
     }
 }
 
-// Helper to create an array of unique Pubkeys
-fn create_pubkey_array<const N: usize>() -> [Pubkey; N] {
-    let mut arr = [Pubkey::default(); N];
-    for i in 0..N {
-        arr[i] = Pubkey::new_unique();
-    }
-    arr
-}
-
 // Helper to create AccountInfo with discriminator
 fn create_account_info<'a>(key: &'a Pubkey, lamports: &'a mut u64, data: &'a mut Vec<u8>, owner: &'a Pubkey, discriminator: &[u8], serialized_data: &[u8]) -> AccountInfo<'a> {
     data.clear();
@@ -166,11 +157,12 @@ fn test_send_request_logic() {
     chain_whitelist[0] = 42;
     let mut sender_whitelist = [Pubkey::default(); 8];
     sender_whitelist[0] = payer;
-    let target_chain_id = 42u64;
-    let receiver = Pubkey::new_unique();
+    let sender = crate::ID.to_string();
+    let dst_chain_id = 42u64;
+    let receiver = "evm_contract_address".to_string();
     let message = b"test message";
     let token_transfer_metadata = TokenTransferMetadata {
-        target_chain_id,
+        target_chain_id: dst_chain_id,
         token_address: Pubkey::new_unique(),
         symbol: [0u8; 16],
         amount: 123,
@@ -182,7 +174,8 @@ fn test_send_request_logic() {
         &payer,
         &chain_whitelist,
         &sender_whitelist,
-        target_chain_id,
+        &sender,
+        dst_chain_id,
         &receiver,
         message,
         &token_transfer_metadata,
@@ -196,7 +189,8 @@ fn test_send_request_logic() {
         &fake,
         &chain_whitelist,
         &sender_whitelist,
-        target_chain_id,
+        &sender,
+        dst_chain_id,
         &receiver,
         message,
         &token_transfer_metadata,
@@ -209,6 +203,7 @@ fn test_send_request_logic() {
         &payer,
         &[1u64;8],
         &sender_whitelist,
+        &sender,
         999,
         &receiver,
         message,
