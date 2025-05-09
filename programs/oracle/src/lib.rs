@@ -3,12 +3,10 @@
 
 use anchor_lang::prelude::*;
 use anchor_lang::prelude::{AnchorSerialize, AnchorDeserialize};
-use anchor_lang::Discriminator;
 use anchor_lang::error_code;
 use solana_program::sysvar::clock::Clock;
 use anchor_lang::solana_program::sysvar;
 use solana_program::sysvar::instructions::{load_current_index_checked, load_instruction_at_checked};
-use solana_program::secp256k1_program;
 use sha2::Sha256;
 use sha2::Digest;
 use hex;
@@ -200,6 +198,15 @@ pub struct RemoveSender<'info> {
     pub authority: Signer<'info>,
 }
 
+#[derive(Accounts)]
+pub struct Transmit<'info> {
+    #[account(mut)]
+    pub oracle_config: Account<'info, OracleConfig>,
+    #[account(mut)]
+    pub cross_chain_message: Account<'info, CrossChainMessage>,
+    // Extendable for other contract state accounts
+}
+
 // --- Error Codes ---
 
 #[error_code]
@@ -367,6 +374,64 @@ pub mod Oracle {
             ctx.accounts.epoch_state.epoch,
             Clock::from_account_info(&ctx.accounts.clock)?.unix_timestamp,
         )?;
+        Ok(())
+    }
+    pub fn transmit(ctx: Context<Transmit>, data: Vec<u8>, instructions_account: AccountInfo) -> Result<()> {
+        // data: [rc_len|rc_bytes|msg_len|msg_bytes|meta_len|meta_bytes|sig_count|sig1_len|sig1|sig2_len|sig2|...]
+        let mut offset = 0;
+        let read_u32 = |data: &[u8], offset: &mut usize| -> u32 {
+            let v = u32::from_le_bytes(data[*offset..*offset+4].try_into().unwrap());
+            *offset += 4;
+            v
+        };
+        let read_vec = |data: &[u8], offset: &mut usize, len: usize| -> Vec<u8> {
+            let v = data[*offset..*offset+len].to_vec();
+            *offset += len;
+            v
+        };
+        let rc_len = read_u32(&data, &mut offset) as usize;
+        let report_context_bytes = read_vec(&data, &mut offset, rc_len);
+        let msg_len = read_u32(&data, &mut offset) as usize;
+        let message = read_vec(&data, &mut offset, msg_len);
+        let meta_len = read_u32(&data, &mut offset) as usize;
+        let token_transfer_metadata_bytes = read_vec(&data, &mut offset, meta_len);
+        let sig_count = read_u32(&data, &mut offset) as usize;
+        let mut signatures = Vec::with_capacity(sig_count);
+        for _ in 0..sig_count {
+            let sig_len = read_u32(&data, &mut offset) as usize;
+            let sig = read_vec(&data, &mut offset, sig_len);
+            signatures.push(sig);
+        }
+        
+        let report_context = ReportContext::try_from_slice(&report_context_bytes)
+            .map_err(|_| OracleError::InvalidMetadata)?;
+        let _token_transfer_metadata = TokenTransferMetadata::try_from_slice(&token_transfer_metadata_bytes)
+            .map_err(|_| OracleError::InvalidMetadata)?;
+        require!(ctx.accounts.cross_chain_message.message_id == report_context.message_id, OracleError::InvalidMetadata);
+        let mut hasher = Sha256::new();
+        hasher.update(&report_context_bytes);
+        hasher.update(&message);
+        hasher.update(&token_transfer_metadata_bytes);
+        let digest = hasher.finalize();
+        let oracle_config = &ctx.accounts.oracle_config;
+        let mut unique_validators = std::collections::HashSet::new();
+        for (i, node_pk) in oracle_config.oracle_nodes.iter().enumerate() {
+            if *node_pk == Pubkey::default() { continue; }
+            if i >= signatures.len() { break; }
+            let sig = &signatures[i];
+            let pk_bytes = node_pk.to_bytes();
+            if verify_signature_secp256k1(&digest, sig, &pk_bytes, &instructions_account) {
+                unique_validators.insert(node_pk);
+            }
+        }
+        let threshold = (oracle_config.oracle_nodes.iter().filter(|x| **x != Pubkey::default()).count() / 2) + 1;
+        require!(unique_validators.len() >= threshold, OracleError::Unauthorized);
+        let cross_chain_message = &mut ctx.accounts.cross_chain_message;
+        if cross_chain_message.status != 0 {
+            return Err(OracleError::DuplicateMessageId.into());
+        }
+        cross_chain_message.status = 1;
+        msg!("Transmit success: message_id={}", report_context.message_id);
         Ok(())
     }
 }
