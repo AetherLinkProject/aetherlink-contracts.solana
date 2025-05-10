@@ -288,26 +288,6 @@ fn test_verify_signatures_secp256k1_always_false() {
 }
 
 #[test]
-fn test_register_node_logic_success() {
-    let mut node = OracleNode::default();
-    let node_id = 42;
-    let pubkey = Pubkey::new_unique();
-    register_node_logic(&mut node, node_id, pubkey);
-    assert_eq!(node.node_id, node_id);
-    assert_eq!(node.pubkey, pubkey);
-}
-
-#[test]
-fn test_update_node_logic_success() {
-    let mut node = OracleNode { node_id: 1, pubkey: Pubkey::new_unique() };
-    let new_id = 99;
-    let new_pubkey = Pubkey::new_unique();
-    update_node_logic(&mut node, new_id, new_pubkey);
-    assert_eq!(node.node_id, new_id);
-    assert_eq!(node.pubkey, new_pubkey);
-}
-
-#[test]
 fn test_initialize_logic_success() {
     let mut config = OracleConfig {
         admin: Pubkey::default(),

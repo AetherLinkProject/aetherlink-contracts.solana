@@ -6,7 +6,7 @@ resolution = true
 skip-lint = false
 
 [programs.localnet]
-oracle = "programs/oracle/target/deploy/oracle.so"
+oracle = "Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkgMQHGt1hFJk"
 
 [registry]
 url = "https://api.apr.dev"

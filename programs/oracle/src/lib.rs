@@ -10,6 +10,7 @@ use solana_program::sysvar::instructions::{load_current_index_checked, load_inst
 use sha2::Sha256;
 use sha2::Digest;
 use hex;
+use anchor_lang::solana_program::{keccak, secp256k1_recover::secp256k1_recover};
 
 // declare_id for the program
 
@@ -84,6 +85,13 @@ pub struct OracleConfig {
     pub oracle_nodes: [Pubkey; 8], // Fixed-length oracle node set
     pub sender_whitelist: [Pubkey; 8], // Fixed-length sender whitelist
     pub is_initialized: bool, // Initialization flag
+}
+
+#[derive(Debug, AnchorSerialize, AnchorDeserialize, Clone, Default)]
+pub struct DecryptedReport {
+    pub round_id: u64,
+    pub answer: i128,
+    pub timestamp: u64,
 }
 
 // --- Context/Accounts Structs ---
@@ -226,16 +234,6 @@ pub enum OracleError {
 
 // --- Logic Functions ---
 
-pub fn register_node_logic(node: &mut OracleNode, node_id: u64, pubkey: Pubkey) {
-    node.node_id = node_id;
-    node.pubkey = pubkey;
-}
-
-pub fn update_node_logic(node: &mut OracleNode, node_id: u64, pubkey: Pubkey) {
-    node.node_id = node_id;
-    node.pubkey = pubkey;
-}
-
 pub fn initialize_logic(config: &mut OracleConfig, authority: &Pubkey, chain_ids: [u64; 8], node_pubkeys: [Pubkey; 8]) -> Result<()> {
     require!(!config.is_initialized, OracleError::InvalidMetadata);
     config.admin = *authority;
@@ -331,6 +329,26 @@ pub fn send_request_logic(
     Ok(message_id)
 }
 
+/// Mock 解密方法，结构对齐 Chainlink OCR2 合约
+pub fn decrypt_report(data: &[u8]) -> Result<DecryptedReport, OracleError> {
+    // 伪解密逻辑：直接从 data 取部分字节填充结构
+    if data.len() < 24 {
+        return Err(OracleError::InvalidMetadata.into());
+    }
+    let round_id = u64::from_le_bytes(data[0..8].try_into().unwrap());
+    let answer = i128::from_le_bytes(data[8..24].try_into().unwrap());
+    let timestamp = if data.len() >= 32 {
+        u64::from_le_bytes(data[24..32].try_into().unwrap())
+    } else {
+        0
+    };
+    Ok(DecryptedReport {
+        round_id,
+        answer,
+        timestamp,
+    })
+}
+
 // Program module forwarding
 pub mod Oracle {
     use super::*;
@@ -374,8 +392,8 @@ pub mod Oracle {
         )?;
         Ok(())
     }
-    pub fn transmit(ctx: Context<Transmit>, data: Vec<u8>, instructions_account: AccountInfo) -> Result<()> {
-        // data: [rc_len|rc_bytes|msg_len|msg_bytes|meta_len|meta_bytes|sig_count|sig1_len|sig1|sig2_len|sig2|...]
+    pub fn transmit(ctx: Context<Transmit>, data: Vec<u8>, _instructions_account: AccountInfo) -> Result<()> {
+        // data: [rc_len|rc_bytes|msg_len|msg_bytes|meta_len|meta_bytes|sig_count|sig1(64)|rec_id1(1)|sig2|rec_id2|...]
         let mut offset = 0;
         let read_u32 = |data: &[u8], offset: &mut usize| -> u32 {
             let v = u32::from_le_bytes(data[*offset..*offset+4].try_into().unwrap());
@@ -395,31 +413,38 @@ pub mod Oracle {
         let token_transfer_metadata_bytes = read_vec(&data, &mut offset, meta_len);
         let sig_count = read_u32(&data, &mut offset) as usize;
         let mut signatures = Vec::with_capacity(sig_count);
+        let mut recovery_ids = Vec::with_capacity(sig_count);
         for _ in 0..sig_count {
-            let sig_len = read_u32(&data, &mut offset) as usize;
-            let sig = read_vec(&data, &mut offset, sig_len);
+            let sig = read_vec(&data, &mut offset, 64); // 64字节签名
+            let rec_id = data[offset];
+            offset += 1;
             signatures.push(sig);
+            recovery_ids.push(rec_id);
         }
-        
         let report_context = ReportContext::try_from_slice(&report_context_bytes)
             .map_err(|_| OracleError::InvalidMetadata)?;
         let _token_transfer_metadata = TokenTransferMetadata::try_from_slice(&token_transfer_metadata_bytes)
             .map_err(|_| OracleError::InvalidMetadata)?;
         require!(ctx.accounts.cross_chain_message.message_id == report_context.message_id, OracleError::InvalidMetadata);
-        let mut hasher = Sha256::new();
-        hasher.update(&report_context_bytes);
-        hasher.update(&message);
-        hasher.update(&token_transfer_metadata_bytes);
-        let digest = hasher.finalize();
+        // --- chainlink风格验签 ---
+        let mut hasher = keccak::Hasher::default();
+        hasher.hash(&report_context_bytes);
+        hasher.hash(&message);
+        hasher.hash(&token_transfer_metadata_bytes);
+        let hash = hasher.result(); // [u8; 32]
         let oracle_config = &ctx.accounts.oracle_config;
         let mut unique_validators = std::collections::HashSet::new();
-        for (i, node_pk) in oracle_config.oracle_nodes.iter().enumerate() {
-            if *node_pk == Pubkey::default() { continue; }
-            if i >= signatures.len() { break; }
+        for i in 0..signatures.len() {
             let sig = &signatures[i];
-            let pk_bytes = node_pk.to_bytes();
-            if verify_signature_secp256k1(&digest, sig, &pk_bytes, &instructions_account) {
-                unique_validators.insert(node_pk);
+            let rec_id = recovery_ids[i];
+            if let Ok(pubkey) = secp256k1_recover(&hash, rec_id, sig) {
+                // pubkey.0 为 64字节公钥
+                for node_pk in oracle_config.oracle_nodes.iter() {
+                    if *node_pk == Pubkey::default() { continue; }
+                    if node_pk.to_bytes() == pubkey.0 {
+                        unique_validators.insert(*node_pk);
+                    }
+                }
             }
         }
         let threshold = (oracle_config.oracle_nodes.iter().filter(|x| **x != Pubkey::default()).count() / 2) + 1;
