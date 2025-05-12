@@ -1,0 +1,22 @@
+[package]
+name = "ramp"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+anchor-lang = "0.31.0"
+
+[dev-dependencies]
+anchor-lang = "0.31.0"
+secp256k1 = { version = "0.28", features = ["rand", "hashes"] }
+rand = "0.8"
+solana-sdk = "1.16"
+tokio = { version = "1.28", features = ["macros", "rt-multi-thread", "sync", "time"] }
+solana-program-test = "1.16"
+
+[features]
+test-bpf = []
+idl-build = ["anchor-lang/idl-build"]
